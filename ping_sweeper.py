@@ -4,6 +4,8 @@ from queue import Queue
 import time
 import argparse
 import ipaddress
+import subprocess
+import sys
 
 # --- Configuration ---
 # Number of concurrent threads to use for scanning.
@@ -18,6 +20,9 @@ PING_TIMEOUT = 1
 # A thread-safe queue to hold all the IP addresses to be scanned.
 ip_queue = Queue()
 
+# An event to signal all threads to stop.
+stop_event = threading.Event()
+
 # A thread-safe list to store the IP addresses that are up.
 # We use a lock to ensure that appending to the list is safe across threads.
 active_hosts = []
@@ -29,7 +34,8 @@ def pinger(q):
     and adds it to the active_hosts list if it's responsive.
     This function is executed by each thread.
     """
-    while not q.empty():
+    # The loop continues as long as there are items in the queue AND the stop event is not set.
+    while not q.empty() and not stop_event.is_set():
         try:
             # Get an IP address from the queue. 'block=False' prevents waiting.
             ip = q.get(block=False)
@@ -37,25 +43,26 @@ def pinger(q):
             # If the queue is empty, the thread can exit.
             break
 
-        # Construct the ping command.
-        # '-c 1' sends one packet.
-        # '-W {PING_TIMEOUT}' sets the timeout.
-        # Redirection sends all output to /dev/null to keep the console clean.
-        command = f"ping -c 1 -W {PING_TIMEOUT} {ip} > /dev/null 2>&1"
-        response = os.system(command)
+        # Use subprocess for more control. This is for Linux.
+        command = ["ping", "-c", "1", "-W", str(PING_TIMEOUT), str(ip)]
 
-        # A response code of 0 means the ping was successful.
-        if response == 0:
-            print(f"[+] {ip} is up")
-            with list_lock:
-                active_hosts.append(ip)
-        else:
-            # Optional: uncomment the line below for verbose output on failed pings.
-            # print(f"[-] {ip} is down")
+        try:
+            # We don't need the output, so we send it to DEVNULL.
+            response = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=PING_TIMEOUT + 0.5)
+            # A response code of 0 means the ping was successful.
+            if response.returncode == 0:
+                print(f"[+] {ip} is up")
+                with list_lock:
+                    active_hosts.append(str(ip))
+        except subprocess.TimeoutExpired:
+            # This handles cases where the ping command itself hangs
             pass
-
-        # Signal that the task from the queue is done.
-        q.task_done()
+        except Exception:
+            # Catch other potential exceptions
+            pass
+        finally:
+            # Signal that the task from the queue is done.
+            q.task_done()
 
 def main():
     """
@@ -80,32 +87,42 @@ def main():
 
     # 1. Populate the queue with all possible host IPs in the target subnet.
     for ip in network.hosts():
-        ip_queue.put(str(ip))
+        ip_queue.put(ip)
 
     # 2. Create and start the threads
     threads = []
     for _ in range(NUM_THREADS):
-        # Create a thread that will run the pinger function.
-        # 'daemon=True' allows the main program to exit even if threads are running.
-        thread = threading.Thread(target=pinger, args=(ip_queue,), daemon=True)
+        # We don't use daemon threads because we want to wait for them to finish.
+        thread = threading.Thread(target=pinger, args=(ip_queue,))
         thread.start()
         threads.append(thread)
 
-    # 3. Wait for the queue to be empty.
-    # This means all IPs have been processed by the threads.
-    ip_queue.join()
+    try:
+        # 3. Wait for the queue to be empty. This is the main blocking call.
+        ip_queue.join()
+    except KeyboardInterrupt:
+        print("\n\n[!] User interrupted. Signalling threads to stop...")
+        stop_event.set()
 
-    # 4. Write the list of active hosts to the output file
-    print("\n[INFO] Scan complete.")
-    print(f"[INFO] Writing {len(active_hosts)} active hosts to {OUTPUT_FILE}...")
-    
-    # Sort the IPs for a clean and ordered output file.
-    # We use the ip_address object for a correct numerical sort.
-    sorted_hosts = sorted(active_hosts, key=ipaddress.ip_address)
-    
-    with open(OUTPUT_FILE, 'w') as f:
-        for ip in sorted_hosts:
-            f.write(f"{ip}\n")
+    # 4. Wait for all worker threads to complete their current task and exit.
+    print("[INFO] Waiting for active threads to finish...")
+    for thread in threads:
+        thread.join()
+
+    # 5. Write the list of active hosts to the output file
+    print("\n[INFO] Scan finished or was interrupted.")
+    if active_hosts:
+        print(f"[INFO] Writing {len(active_hosts)} active hosts to {OUTPUT_FILE}...")
+        
+        # Sort the IPs for a clean and ordered output file.
+        sorted_hosts = sorted(active_hosts, key=ipaddress.ip_address)
+        
+        with open(OUTPUT_FILE, 'w') as f:
+            for ip in sorted_hosts:
+                f.write(f"{ip}\n")
+    else:
+        print("[INFO] No active hosts were found.")
+
 
     end_time = time.time()
     print(f"[INFO] Done. Scan took {end_time - start_time:.2f} seconds.")
