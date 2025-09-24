@@ -218,8 +218,8 @@ def main():
 
     with print_lock:
         #print("[INFO] Waiting for active threads to finish...")
-    for thread in threads:
-        thread.join()
+        for thread in threads:
+            thread.join()
     progress_thread.join()
 
     # Write results
